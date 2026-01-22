@@ -1,239 +1,195 @@
 import pandas as pd
-import xgboost as xgb
 import numpy as np
-import os
 import pickle
-import re
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, mean_absolute_error
-from sklearn.preprocessing import LabelEncoder
+import json
+import os
+import warnings
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import RobustScaler
 
-# --- VERSION CHECK ---
-print("\n✅ RUNNING FINAL SCRIPT V5 (Added Player DNA Engine)\n")
+warnings.filterwarnings("ignore")
+
+# --- IMPORT HELPERS ---
+try:
+    from predict_impact import predict_transfer, clean_txt
+    from chemistry import get_squad_chemistry_map, load_chemistry_engine, get_target_squad
+except ImportError:
+    print("⚠️  Helpers not found. Make sure predict_impact.py and chemistry.py are in the folder.")
 
 # --- CONFIGURATION ---
-TRANSFERS_FILE = "transfers.csv"       
-MARKET_FILE = "market_values.csv"      
-STATS_FILE = "scout_data_weighted.csv" 
-WAGES_FILE = "wages.csv"               
-PLAYSTYLE_FILE = "team_playstyles.csv" 
+KNN_MODEL = "knn_similarity.pkl"
+KNN_SCALER = "knn_scaler.pkl"
+SCOUT_DATA = "scout_outfield.csv"
 
-# OUTPUT MODELS
-REGRESSION_MODEL = "impact_model_hybrid.json"
-CLASSIFIER_MODEL = "success_probability_model.pkl"
-DNA_MODEL = "player_dna_model.pkl"         # <--- NEW
-DNA_ENCODER = "dna_label_encoder.pkl"      # <--- NEW
-STYLE_COLUMNS_FILE = "style_columns.pkl" 
-
-# FEATURES
-BASE_FEATURES = [
-    'Gls_Standard_Per90', 'Ast_Standard_Per90', 'npxG_Per', 'xAG_Per',
-    'PrgP_Per90', 'PrgC_Carries_Per90', 'TklW_Tackles_Per90', 
-    'Int_Def_Per90', 'Won_percent_Aerial', 'SCA90_SCA'
+# --- 🧬 THE 24 DNA FEATURES ---
+# These are the stats that define "Playstyle"
+DNA_FEATURES = [
+    'Gls_Standard_Per90', 'Ast_Standard_Per90', 'npxG_Per', 'xAG_Per', 
+    'Sh_per_90_Standard', 'SoT_percent_Standard', 'G_per_Sh_Standard',
+    'PrgP_Per90', 'PrgC_Carries_Per90', 'Att_Take_Per90', 'Succ_Take_Per90',
+    'TklW_Tackles_Per90', 'Int_Def_Per90', 'Blocks_Blocks_Per90', 'Clr_Per90',
+    'Won_percent_Aerial', 'SCA90_SCA', 'GCA90_GCA', 'Cmp_percent_Total',
+    'Cmp_Short_Per90', 'Cmp_Medium_Per90', 'Cmp_Long_Per90', 
+    'Att Pen_Touches_Per90', 'Recov_Per90'
 ]
 
-# --- HELPER FUNCTIONS ---
-def clean_team_name(name):
-    if not isinstance(name, str): return ""
-    name = name.lower()
-    replacements = [" fc", "cf ", " ac", "as ", "borussia ", "bayer ", "sporting ", "jk", "fk"]
-    for r in replacements: name = name.replace(r, "")
-    return name.strip()
+# --- GLOBAL RESOURCES ---
+_knn = None
+_scaler = None
+_df_scout = None
 
-def clean_money(val):
-    if pd.isna(val): return 0
-    if isinstance(val, (int, float)): return val
-    clean = re.sub(r'[^\d.]', '', str(val))
-    try: return float(clean)
-    except: return 0
-
-def simplify_position(pos):
-    """Maps specific positions to general DNA classes."""
-    if not isinstance(pos, str): return "Unknown"
-    pos = pos.lower()
-    if "goalkeeper" in pos: return "GK"
-    if "back" in pos or "defender" in pos: return "DEF"
-    if "midfield" in pos: return "MID"
-    if "winger" in pos or "forward" in pos or "striker" in pos: return "ATT"
-    return "Unknown"
-
-# --- TRAINING ENGINES ---
-
-def train_dna_engine(df_stats, df_market):
-    """
-    Trains a classifier to predict a player's 'True Position' based on stats.
-    Useful for finding players playing out of position (e.g. inverted fullbacks).
-    """
-    print("🧬 Training Player DNA Model (Position Classifier)...")
+def train_new_knn_model():
+    """Forces a retrain of the KNN model to fix feature mismatch errors."""
+    print("\n🔄 RE-TRAINING KNN MODEL (Fixing Feature Mismatch)...")
     
-    # 1. Merge Stats with Position Labels
-    # We use the Market Value file because it has the 'player_position' column
-    df_stats['join_key'] = df_stats['Player'].str.lower().str.strip()
-    df_market['join_key'] = df_market['player_name'].str.lower().str.strip()
-    
-    # Inner join - we need both stats and a label
-    merged = pd.merge(df_stats, df_market[['join_key', 'player_position']], on='join_key', how='inner')
-    
-    if merged.empty:
-        print("   ⚠️ No matching players found for DNA training. Skipping.")
+    if not os.path.exists(SCOUT_DATA):
+        print(f"❌ Error: {SCOUT_DATA} not found.")
         return
 
-    # 2. Process Labels
-    merged['simple_pos'] = merged['player_position'].apply(simplify_position)
-    valid_data = merged[merged['simple_pos'] != "Unknown"].copy()
+    df = pd.read_csv(SCOUT_DATA)
     
-    X = valid_data[BASE_FEATURES].fillna(0).values
-    y = valid_data['simple_pos'].values
+    # 1. Select only valid DNA columns that exist in the Data
+    valid_features = [c for c in DNA_FEATURES if c in df.columns]
     
-    # 3. Train
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.2, random_state=42)
-    
-    dna_model = LogisticRegression(multi_class='multinomial', max_iter=2000)
-    dna_model.fit(X_train, y_train)
-    
-    acc = accuracy_score(y_test, dna_model.predict(X_test))
-    print(f"   🎯 DNA Accuracy: {acc*100:.1f}% (Can identify {le.classes_})")
-    
-    # 4. Save
-    with open(DNA_MODEL, 'wb') as f: pickle.dump(dna_model, f)
-    with open(DNA_ENCODER, 'wb') as f: pickle.dump(le, f)
+    if len(valid_features) < 10:
+        print("❌ Error: Not enough DNA columns found in CSV.")
+        return
 
-def process_dataset(transfers, elo_start_file, elo_end_file, df_stats, df_wages, df_playstyle, season_label):
-    print(f"   -> Processing {season_label} data...")
+    print(f"   Training on {len(valid_features)} DNA features...")
     
-    # Merge Wages
-    if not df_wages.empty:
-        transfers = pd.merge(transfers, df_wages[['PLAYER', 'GROSS P/W']], 
-                             left_on='player_name', right_on='PLAYER', how='left')
-        transfers['GROSS P/W'] = transfers['GROSS P/W'].apply(clean_money)
+    # 2. Prepare Data
+    X = df[valid_features].fillna(0)
+    
+    # 3. Scale
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # 4. Train KNN
+    knn = NearestNeighbors(n_neighbors=6, metric='cosine', algorithm='brute')
+    knn.fit(X_scaled)
+    
+    # 5. Save Fresh Files
+    with open(KNN_MODEL, 'wb') as f: pickle.dump(knn, f)
+    with open(KNN_SCALER, 'wb') as f: pickle.dump(scaler, f)
+    
+    # Save the feature list
+    with open("dna_features.json", "w") as f: json.dump(valid_features, f)
+    
+    print("✅ New KNN Model & Scaler Saved Successfully!")
+
+def load_knn_resources():
+    global _knn, _scaler, _df_scout
+    
+    # If files don't exist, train them first
+    if not os.path.exists(KNN_MODEL) or not os.path.exists(KNN_SCALER):
+        train_new_knn_model()
+
+    if _knn is None:
+        with open(KNN_MODEL, 'rb') as f: _knn = pickle.load(f)
+        with open(KNN_SCALER, 'rb') as f: _scaler = pickle.load(f)
+        _df_scout = pd.read_csv(SCOUT_DATA)
+        _df_scout['search_key'] = _df_scout['Player'].apply(lambda x: str(x).lower().strip())
+
+def get_similar_players(player_name, n=4):
+    """Uses the KNN model to find players with similar stats."""
+    load_knn_resources()
+    
+    # 1. Load the feature list
+    if os.path.exists("dna_features.json"):
+        with open("dna_features.json", "r") as f:
+            model_features = json.load(f)
     else:
-        transfers['GROSS P/W'] = 0
+        # Fallback if json missing 
+        model_features = [c for c in DNA_FEATURES if c in _df_scout.columns]
 
-    # Merge Playstyle
-    if not df_playstyle.empty:
-        transfers['join_team'] = transfers.apply(
-            lambda x: x.get('team_name') if 'team_name' in x else x.get('current_club'), axis=1
-        ).apply(clean_team_name)
+    # 2. Find Target Player
+    s_key = clean_txt(player_name)
+    target = _df_scout[_df_scout['search_key'] == s_key]
+    
+    if target.empty:
+        return []
+
+    # 3. Create Vector 
+    target_vec = target.iloc[0][model_features].fillna(0).values.reshape(1, -1)
+    
+    # 4. Scale & Query
+    target_vec_scaled = _scaler.transform(target_vec)
+    distances, indices = _knn.kneighbors(target_vec_scaled, n_neighbors=n+1)
+    
+    results = []
+    for i in range(1, len(indices[0])):
+        idx = indices[0][i]
+        sim_player = _df_scout.iloc[idx]
         
-        df_playstyle['join_team'] = df_playstyle['Team'].apply(clean_team_name)
-        style_map = df_playstyle[['join_team', 'Main_Style']].drop_duplicates()
-        transfers = pd.merge(transfers, style_map, on='join_team', how='left')
-        transfers['Main_Style'] = transfers['Main_Style'].fillna('Unknown')
-    else:
-        transfers['Main_Style'] = 'Unknown'
-
-    # Load Elo
-    if not os.path.exists(elo_start_file) or not os.path.exists(elo_end_file):
-        return [], [], [], []
-
-    df_elo_old = pd.read_csv(elo_start_file)
-    df_elo_new = pd.read_csv(elo_end_file)
-    
-    # Elo Merge Logic (Simplified for brevity, assumes standard columns)
-    col_old = next((c for c in df_elo_old.columns if 'elo' in c.lower()), None)
-    col_new = next((c for c in df_elo_new.columns if 'elo' in c.lower()), None)
-    
-    df_elo_old['join_key'] = df_elo_old.iloc[:,0].apply(clean_team_name) # Assuming Team is 1st col
-    df_elo_new['join_key'] = df_elo_new.iloc[:,0].apply(clean_team_name)
-    
-    elo_map = pd.merge(df_elo_old, df_elo_new, on='join_key', suffixes=('_old', '_new'))
-    # Dynamic column grab
-    old_elo_col = f"{col_old}_old"
-    new_elo_col = f"{col_new}_new"
-    
-    # Build Dataset
-    X_list, y_reg, y_class = [], [], []
-    
-    df_stats['join_name'] = df_stats['Player'].astype(str).str.lower().str.strip()
-    style_dummies = pd.get_dummies(transfers['Main_Style'], prefix='Style')
-    transfers = pd.concat([transfers, style_dummies], axis=1)
-    style_cols = [c for c in transfers.columns if c.startswith('Style_')]
-    
-    for idx, row in transfers.iterrows():
-        # Match Player & Team
-        team_key = clean_team_name(row.get('team_name') or row.get('current_club'))
-        p_name = str(row.get('player_name')).lower().strip()
+        # Convert cosine distance to similarity %
+        sim_score = (1 - distances[0][i]) * 100
         
-        team_row = elo_map[elo_map['join_key'] == team_key]
-        p_stats = df_stats[df_stats['join_name'] == p_name]
+        results.append({
+            "name": sim_player['Player'],
+            "team": sim_player['Team'],
+            "similarity": f"{sim_score:.1f}%"
+        })
         
-        if team_row.empty or p_stats.empty: continue
-        
-        try:
-            # Features
-            stats_vec = p_stats.iloc[0][BASE_FEATURES].fillna(0).values
-            start_elo = team_row.iloc[0][old_elo_col]
-            delta_elo = team_row.iloc[0][new_elo_col] - start_elo
-            
-            log_mv = np.log1p(clean_money(row.get('player_market_value_euro', 0)))
-            log_wage = np.log1p(clean_money(row.get('GROSS P/W', 0)))
-            style_vec = row[style_cols].fillna(0).values
-            
-            input_vec = np.concatenate([[start_elo], stats_vec, [log_mv, log_wage], style_vec])
-            
-            X_list.append(input_vec)
-            y_reg.append(delta_elo)
-            y_class.append(1 if delta_elo > 0 else 0)
-        except: continue
-            
-    return X_list, y_reg, y_class, style_cols
+    return results
 
-def train_hybrid_engine():
-    print("🚀 Starting Multi-Stage Training...")
-    base_dir = os.getcwd()
+def generate_scout_report(player_name, target_team):
+    print(f"\n📋 GENERATING FULL SCOUT REPORT: {player_name} -> {target_team}")
+    print("="*60)
     
-    # Load Data
-    stats_path = os.path.join(base_dir, STATS_FILE)
-    if not os.path.exists(stats_path): print(f"❌ Missing {STATS_FILE}"); return
-    df_stats = pd.read_csv(stats_path)
-    
-    wages_path = os.path.join(base_dir, WAGES_FILE)
-    df_wages = pd.read_csv(wages_path) if os.path.exists(wages_path) else pd.DataFrame()
-    
-    playstyle_path = os.path.join(base_dir, PLAYSTYLE_FILE)
-    df_playstyle = pd.read_csv(playstyle_path) if os.path.exists(playstyle_path) else pd.DataFrame()
-
-    # --- 1. TRAIN DNA MODEL ---
-    market_path = os.path.join(base_dir, MARKET_FILE)
-    if os.path.exists(market_path):
-        df_market = pd.read_csv(market_path)
-        train_dna_engine(df_stats, df_market)
-    
-        # --- 2. TRAIN IMPACT MODELS ---
-        subset_2024 = df_market[df_market['season_start_year'] == 2024]
-        X, y_reg, y_class, style_cols = process_dataset(
-            subset_2024, "elo_start_24.csv", "elo_end_24.csv",
-            df_stats, df_wages, df_playstyle, "Season 2024/25"
-        )
-        
-        if style_cols:
-            with open(STYLE_COLUMNS_FILE, 'wb') as f: pickle.dump(style_cols, f)
-
-        if X:
-            X = np.array(X)
-            X_train, X_test, y_r_train, y_r_test, y_c_train, y_c_test = train_test_split(
-                X, np.array(y_reg), np.array(y_class), test_size=0.2, random_state=42
-            )
-            
-            print("📈 Training XGBoost (Impact)...")
-            reg = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=300, max_depth=6)
-            reg.fit(X_train, y_r_train)
-            reg.save_model(REGRESSION_MODEL)
-            
-            print("⚖️  Training Logistic (Success)...")
-            clf = LogisticRegression(max_iter=2000)
-            clf.fit(X_train, y_c_train)
-            with open(CLASSIFIER_MODEL, 'wb') as f: pickle.dump(clf, f)
-            
-            print("\n✅ ALL SYSTEMS GO. Models Saved.")
+    # 1. IMPACT PREDICTION
+    try:
+        impact = predict_transfer(player_name, target_team)
+        if "error" in impact:
+            print(f"❌ {impact['error']}")
         else:
-            print("❌ No Transfer Data Matched.")
-    else:
-        print("❌ Market file missing.")
+            print(f"\n🔮 IMPACT PROJECTION")
+            print(f"   Model Verdict:    {impact['verdict']}")
+            print(f"   Elo Change:       {impact['predicted_impact']:+.2f} points")
+            print(f"   Forecasted Elo:   {impact['forecasted_elo']}")
+    except Exception as e:
+        print(f"❌ Impact Model Error: {e}")
+
+    # 2. CHEMISTRY CHECK
+    print(f"\n⚗️  CHEMISTRY CHECK")
+    try:
+        squad_df = get_target_squad(target_team)
+        if squad_df.empty:
+            print("   ⚠️  Target Squad not found.")
+        else:
+            load_knn_resources()
+            p_row_list = _df_scout[_df_scout['search_key'] == clean_txt(player_name)]
+            
+            if not p_row_list.empty:
+                p_row = p_row_list.iloc[0]
+                chem_df = get_squad_chemistry_map(p_row, squad_df)
+                
+                if not chem_df.empty:
+                    avg_chem = chem_df['Chemistry_Score'].mean()
+                    best_link = chem_df.iloc[0]
+                    print(f"   Avg Squad Fit:    {avg_chem:.1f}/100")
+                    print(f"   Best Partner:     {best_link['Teammate']} (Score: {best_link['Chemistry_Score']:.1f})")
+                else:
+                    print("   ⚠️  No chemistry data available.")
+            else:
+                print("   ⚠️  Player stats not found for chemistry.")
+    except Exception as e:
+        print(f"⚠️  Chemistry Error: {e}")
+
+    # 3. SIMILARITY ENGINE (KNN)
+    print(f"\n🧬 PLAYER DNA (Similar Profiles)")
+    try:
+        similar_players = get_similar_players(player_name)
+        if similar_players:
+            for p in similar_players:
+                print(f"   • {p['name']} ({p['team']}) - {p['similarity']} Match")
+        else:
+            print("   No similar players found.")
+    except Exception as e:
+        print(f"❌ KNN Error: {e}")
 
 if __name__ == "__main__":
-    train_hybrid_engine()
+    if not os.path.exists("dna_features.json"):
+        train_new_knn_model()
+        
+    # Test
+    generate_scout_report("Cole Palmer", "Manchester United")
